@@ -56,8 +56,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # Enable binfmt so we can run riscv64 userland if we fall back to cross-running
-      - name: Set up QEMU binfmt
+      - name: Set up QEMU binfmt (riscv64)
         uses: docker/setup-qemu-action@v3
         with:
           platforms: riscv64
@@ -67,42 +66,47 @@ jobs:
 
       - name: Start RISC-V VM container
         run: |
-          # Clean up if a previous run left leftovers
           docker rm -f riscv-vm 2>/dev/null || true
-
-          # Mount the repo into the container so both outer container and VM can access it (your image may expose it inside guest).
           docker run -d --name riscv-vm \
             -e BOOT_TIMEOUT=900 \
             -v "$GITHUB_WORKSPACE":/workspace \
             cloudv10x/riscv-qemu-ubuntu:latest start
 
-      - name: Wait for VM boot (best-effort)
+      - name: Stream logs and wait for boot ready
         run: |
           set -euo pipefail
-          # Wait up to ~12 minutes for a clear readiness line; adjust the grep to match your image logs.
-          for i in $(seq 1 72); do
-            if docker logs riscv-vm 2>&1 | grep -E "Booting completed|VM ready|✓ RISC-V VM boot - PASSED"; then
-              echo "VM reports ready."
+
+          # stream logs live (background) so you see VM progress in the Actions UI
+          docker logs -f riscv-vm &
+          LOGS_PID=$!
+
+          # wait for your final message from user-init
+          READY_RE="RISC-V Ubuntu image is ready"
+          for i in $(seq 1 90); do  # ~15 minutes at 10s intervals
+            if docker logs riscv-vm 2>&1 | grep -F "$READY_RE" >/dev/null; then
+              echo "::notice::VM reports ready: $READY_RE"
+              kill "$LOGS_PID" || true
               exit 0
             fi
             sleep 10
           done
-          echo "Warning: Did not detect a ready message; attempting to proceed anyway." >&2
+
+          echo "::warning::Timed out waiting for ready message; proceeding anyway."
+          kill "$LOGS_PID" || true
           exit 0
 
-      - name: Run tests inside guest if helper exists; otherwise fall back to riscv64 usermode
+      - name: Run tests inside guest (guest-exec if present, else GOARCH=riscv64)
         run: |
           set -euo pipefail
-          echo "Attempting in-guest execution via /opt/scripts/guest-exec (if available)..."
+          echo "Checking for /opt/scripts/guest-exec in outer container..."
           if docker exec riscv-vm bash -lc 'test -x /opt/scripts/guest-exec'; then
-            # Assumes your image provides a guest execution bridge that runs the command inside the RISC-V Ubuntu VM.
+            echo "Found guest-exec; executing tests inside the RISC-V guest."
             docker exec -e CGO_ENABLED=0 riscv-vm bash -lc \
-              '/opt/scripts/guest-exec "bash -lc '\''cd /workspace && go version || sudo apt-get update && sudo apt-get install -y golang && go test -v ./...'\''"'
+              '/opt/scripts/guest-exec "bash -lc '\''cd /workspace && (go version || (sudo apt-get update && sudo apt-get -y install golang)) && go test -v ./...'\''"'
           else
-            echo "guest-exec not found; running in outer container with GOARCH=riscv64 (binfmt)."
+            echo "guest-exec not found; falling back to binfmt (GOARCH=riscv64) in the outer container."
             docker exec -e CGO_ENABLED=0 -e GOOS=linux -e GOARCH=riscv64 riscv-vm bash -lc '
               set -e
-              # Ensure Go is present in the outer container (if your image already has it, this is a no-op or can be removed)
               if ! command -v go >/dev/null 2>&1; then
                 apt-get update && apt-get install -y golang
               fi
